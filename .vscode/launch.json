@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug opencut-desktop",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--package=opencut-desktop"
+                ],
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

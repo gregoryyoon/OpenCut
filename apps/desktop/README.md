@@ -30,9 +30,21 @@ Both scripts skip installation if Rust is already present. On Linux/macOS/WSL on
 powershell -ExecutionPolicy Bypass -File .\apps\desktop\script\setup.ps1
 ```
 
-**3. Run:**
+**3. Run on powershell:**
 
+```powershell
+$env:CARGO_HTTP_CHECK_REVOKE = "false"
+cargo run -p opencut-desktop
+```
+**4. Run on cmd**
+```cmd
+set CARGO_HTTP_CHECK_REVOKE=false
+cargo run -p opencut-desktop
+```
+
+**4. Run on bash:**
 ```bash
+export CARGO_HTTP_CHECK_REVOKE=false
 cargo run -p opencut-desktop
 ```
 
