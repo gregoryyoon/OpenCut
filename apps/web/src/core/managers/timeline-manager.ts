@@ -5,14 +5,10 @@ import type {
 	TrackType,
 	TimelineTrack,
 	TimelineElement,
-	ClipboardItem,
 	RetimeConfig,
 } from "@/lib/timeline";
 import { calculateTotalDuration } from "@/lib/timeline";
-import {
-	findTrackInSceneTracks,
-	updateElementInSceneTracks,
-} from "@/lib/timeline/track-element-update";
+import { findTrackInSceneTracks } from "@/lib/timeline/track-element-update";
 import {
 	canElementBeHidden,
 	canElementHaveAudio,
@@ -21,8 +17,14 @@ import type {
 	AnimationPath,
 	AnimationInterpolation,
 	AnimationValue,
+	AnimationValueForPath,
 	ScalarCurveKeyframePatch,
 } from "@/lib/animation/types";
+import {
+	getElementLocalTime,
+	resolveAnimationTarget,
+	resolveAnimationPathValueAtTime,
+} from "@/lib/animation";
 import { lastFrameTime } from "opencut-wasm";
 import { BatchCommand } from "@/lib/commands";
 import {
@@ -35,7 +37,6 @@ import {
 	DuplicateElementsCommand,
 	UpdateElementsCommand,
 	SplitElementsCommand,
-	PasteCommand,
 	MoveElementCommand,
 	TracksSnapshotCommand,
 	UpsertKeyframeCommand,
@@ -54,6 +55,10 @@ import {
 	ToggleSourceAudioSeparationCommand,
 } from "@/lib/commands/timeline";
 import type { InsertElementParams } from "@/lib/commands/timeline/element/insert-element";
+import type {
+	PlannedElementMove,
+	PlannedTrackCreation,
+} from "@/lib/timeline/group-move";
 
 export class TimelineManager {
 	private listeners = new Set<() => void>();
@@ -146,25 +151,20 @@ export class TimelineManager {
 		});
 	}
 
-	moveElement({
-		sourceTrackId,
-		targetTrackId,
-		elementId,
-		newStartTime,
-		createTrack,
+	moveElements({
+		moves,
+		createTracks,
 	}: {
-		sourceTrackId: string;
-		targetTrackId: string;
-		elementId: string;
-		newStartTime: number;
-		createTrack?: { type: TrackType; index: number };
+		moves: PlannedElementMove[];
+		createTracks?: PlannedTrackCreation[];
 	}): void {
+		if (moves.length === 0) {
+			return;
+		}
+
 		const command = new MoveElementCommand({
-			sourceTrackId,
-			targetTrackId,
-			elementId,
-			newStartTime,
-			createTrack,
+			moves,
+			createTracks,
 		});
 		this.editor.command.execute({ command });
 	}
@@ -242,18 +242,6 @@ export class TimelineManager {
 		}
 
 		return result;
-	}
-
-	pasteAtTime({
-		time,
-		clipboardItems,
-	}: {
-		time: number;
-		clipboardItems: ClipboardItem[];
-	}): { trackId: string; elementId: string }[] {
-		const command = new PasteCommand({ time, clipboardItems });
-		this.editor.command.execute({ command });
-		return command.getPastedElements();
 	}
 
 	deleteElements({
@@ -492,6 +480,47 @@ export class TimelineManager {
 			return;
 		}
 
+		// Pre-sample values at playhead for each (element, property) pair.
+		// This preserves "what you see is what you get" when all keyframes are deleted.
+		const playheadTime = this.editor.playback.getCurrentTime();
+		const valueAtPlayheadMap = new Map<string, AnimationValue | null>();
+
+		for (const { trackId, elementId, propertyPath } of keyframes) {
+			const key = `${elementId}:${propertyPath}`;
+			if (valueAtPlayheadMap.has(key)) {
+				continue;
+			}
+
+			const element = this.getElementByRef({ trackId, elementId });
+			if (!element) {
+				valueAtPlayheadMap.set(key, null);
+				continue;
+			}
+
+			const localTime = getElementLocalTime({
+				timelineTime: playheadTime,
+				elementStartTime: element.startTime,
+				elementDuration: element.duration,
+			});
+
+			const target = resolveAnimationTarget({ element, path: propertyPath });
+			const baseValue =
+				(target?.getBaseValue() as AnimationValueForPath<AnimationPath> | null) ??
+				null;
+			if (baseValue === null) {
+				valueAtPlayheadMap.set(key, null);
+				continue;
+			}
+
+			const value = resolveAnimationPathValueAtTime({
+				animations: element.animations,
+				propertyPath,
+				localTime,
+				fallbackValue: baseValue,
+			});
+			valueAtPlayheadMap.set(key, value);
+		}
+
 		const commands = keyframes.map(
 			({ trackId, elementId, propertyPath, keyframeId }) =>
 				new RemoveKeyframeCommand({
@@ -499,6 +528,8 @@ export class TimelineManager {
 					elementId,
 					propertyPath,
 					keyframeId,
+					valueAtPlayhead:
+						valueAtPlayheadMap.get(`${elementId}:${propertyPath}`) ?? null,
 				}),
 		);
 		const command =
@@ -546,14 +577,7 @@ export class TimelineManager {
 		}
 
 		const commands = keyframes.map(
-			({
-				trackId,
-				elementId,
-				propertyPath,
-				componentKey,
-				keyframeId,
-				patch,
-			}) =>
+			({ trackId, elementId, propertyPath, componentKey, keyframeId, patch }) =>
 				new UpdateScalarKeyframeCurveCommand({
 					trackId,
 					elementId,
@@ -677,7 +701,9 @@ export class TimelineManager {
 	private applyPreviewOverlay(tracks: SceneTracks): SceneTracks {
 		if (this.previewOverlay.size === 0) return tracks;
 
-		const applyTrackOverlay = <TTrack extends TimelineTrack>(track: TTrack): TTrack => {
+		const applyTrackOverlay = <TTrack extends TimelineTrack>(
+			track: TTrack,
+		): TTrack => {
 			const hasOverlay = track.elements.some((element) =>
 				this.previewOverlay.has(element.id),
 			);
@@ -769,7 +795,11 @@ export class TimelineManager {
 	}
 
 	getPreviewTracks(): SceneTracks | null {
-		return this.previewTracks ?? this.editor.scenes.getActiveSceneOrNull()?.tracks ?? null;
+		return (
+			this.previewTracks ??
+			this.editor.scenes.getActiveSceneOrNull()?.tracks ??
+			null
+		);
 	}
 
 	subscribe(listener: () => void): () => void {

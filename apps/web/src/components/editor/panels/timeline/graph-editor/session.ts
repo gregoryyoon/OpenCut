@@ -1,6 +1,7 @@
 import {
 	getCurveHandlesForNormalizedCubicBezier,
 	getEditableScalarChannels,
+	getEasingModeForKind,
 	getNormalizedCubicBezierForScalarSegment,
 	getScalarKeyframeContext,
 	updateScalarKeyframeCurve,
@@ -22,6 +23,9 @@ const LINEAR_CURVE_EPSILON = 1e-6;
 export type GraphEditorUnavailableReason =
 	| "no-keyframe-selected"
 	| "multiple-keyframes-selected"
+	| "selected-keyframes-span-multiple-elements"
+	| "selected-keyframes-are-not-adjacent"
+	| "selected-properties-have-no-shared-component"
 	| "selected-element-missing"
 	| "selected-element-has-no-animations"
 	| "selected-keyframe-has-no-scalar-channel"
@@ -33,6 +37,22 @@ export type GraphEditorUnavailableReason =
 export interface GraphEditorComponentOption {
 	key: string;
 	label: string;
+}
+
+interface GraphEditorPropertyOption {
+	key: string;
+	label: string;
+	context: ScalarGraphKeyframeContext;
+	allContexts: ScalarGraphKeyframeContext[];
+}
+
+export interface GraphEditorResolvedSegment {
+	propertyPath: SelectedKeyframeRef["propertyPath"];
+	keyframeId: string;
+	context: ScalarGraphKeyframeContext;
+	allContexts: ScalarGraphKeyframeContext[];
+	cubicBezier: NormalizedCubicBezier;
+	referenceSpanValue: number;
 }
 
 interface GraphEditorBaseSelectionState {
@@ -51,10 +71,8 @@ export interface GraphEditorReadyState extends GraphEditorBaseSelectionState {
 	status: "ready";
 	trackId: string;
 	elementId: string;
-	propertyPath: SelectedKeyframeRef["propertyPath"];
-	keyframeId: string;
 	element: TimelineElement;
-	context: ScalarGraphKeyframeContext;
+	segments: GraphEditorResolvedSegment[];
 	cubicBezier: NormalizedCubicBezier;
 }
 
@@ -138,6 +156,40 @@ function findKeyframeTime({
 	return null;
 }
 
+function groupSelectedKeyframesByProperty({
+	selectedKeyframes,
+}: {
+	selectedKeyframes: SelectedKeyframeRef[];
+}) {
+	const groups = new Map<
+		string,
+		{
+			trackId: string;
+			elementId: string;
+			propertyPath: SelectedKeyframeRef["propertyPath"];
+			keyframes: SelectedKeyframeRef[];
+		}
+	>();
+
+	for (const keyframe of selectedKeyframes) {
+		const groupKey = `${keyframe.trackId}:${keyframe.elementId}:${keyframe.propertyPath}`;
+		const existingGroup = groups.get(groupKey);
+		if (existingGroup) {
+			existingGroup.keyframes.push(keyframe);
+			continue;
+		}
+
+		groups.set(groupKey, {
+			trackId: keyframe.trackId,
+			elementId: keyframe.elementId,
+			propertyPath: keyframe.propertyPath,
+			keyframes: [keyframe],
+		});
+	}
+
+	return [...groups.values()];
+}
+
 function getComponentLabel({ componentKey }: { componentKey: string }): string {
 	switch (componentKey) {
 		case "value":
@@ -147,127 +199,113 @@ function getComponentLabel({ componentKey }: { componentKey: string }): string {
 	}
 }
 
-function isFlatSegment({
+/**
+ * Returns the absolute value span of the nearest non-flat adjacent segment,
+ * used as the Y-axis scale when editing a flat segment in the graph editor.
+ * Falls back to 1.0 if all surrounding segments are also flat.
+ */
+function getReferenceSpanValue({
 	context,
 }: {
 	context: ScalarGraphKeyframeContext;
-}): boolean {
-	if (!context.nextKey) {
-		return true;
+}): number {
+	const sorted = [...context.channel.keys].sort((a, b) => a.time - b.time);
+	const leftIndex = sorted.findIndex((k) => k.id === context.keyframe.id);
+	const rightIndex = context.nextKey
+		? sorted.findIndex((k) => k.id === context.nextKey?.id)
+		: -1;
+
+	for (let i = leftIndex - 1; i >= 0; i--) {
+		const span = Math.abs(sorted[i + 1].value - sorted[i].value);
+		if (span > FLAT_VALUE_EPSILON) return span;
 	}
 
-	return (
-		Math.abs(context.nextKey.value - context.keyframe.value) <=
-		FLAT_VALUE_EPSILON
-	);
-}
-
-function isLinearCurve({
-	cubicBezier,
-}: {
-	cubicBezier: NormalizedCubicBezier;
-}): boolean {
-	return (
-		Math.abs(cubicBezier[0]) <= LINEAR_CURVE_EPSILON &&
-		Math.abs(cubicBezier[1]) <= LINEAR_CURVE_EPSILON &&
-		Math.abs(cubicBezier[2] - 1) <= LINEAR_CURVE_EPSILON &&
-		Math.abs(cubicBezier[3] - 1) <= LINEAR_CURVE_EPSILON
-	);
-}
-
-export function resolveGraphEditorSelectionState({
-	tracks,
-	selectedKeyframes,
-	preferredComponentKey,
-}: {
-	tracks: SceneTracks;
-	selectedKeyframes: SelectedKeyframeRef[];
-	preferredComponentKey?: string | null;
-}): GraphEditorSelectionState {
-	if (selectedKeyframes.length === 0) {
-		return createUnavailableState({
-			reason: "no-keyframe-selected",
-			message: "Select a keyframe to edit its curve.",
-		});
-	}
-
-	if (selectedKeyframes.length > 2) {
-		return createUnavailableState({
-			reason: "multiple-keyframes-selected",
-			message: "Select one or two adjacent keyframes to edit a curve.",
-		});
-	}
-
-	if (selectedKeyframes.length === 2) {
-		const [firstKeyframe, secondKeyframe] = selectedKeyframes;
-		if (
-			firstKeyframe.trackId !== secondKeyframe.trackId ||
-			firstKeyframe.elementId !== secondKeyframe.elementId ||
-			firstKeyframe.propertyPath !== secondKeyframe.propertyPath
-		) {
-			return createUnavailableState({
-				reason: "multiple-keyframes-selected",
-				message: "Selected keyframes must be on the same element and property.",
-			});
+	if (rightIndex !== -1) {
+		for (let i = rightIndex; i < sorted.length - 1; i++) {
+			const span = Math.abs(sorted[i + 1].value - sorted[i].value);
+			if (span > FLAT_VALUE_EPSILON) return span;
 		}
 	}
 
-	const primaryKeyframe = selectedKeyframes[0];
-	const secondaryKeyframeId =
-		selectedKeyframes.length === 2 ? selectedKeyframes[1].keyframeId : null;
+	return 1.0;
+}
 
-	const selectedElement = findElementByKeyframe({
-		tracks,
-		keyframe: primaryKeyframe,
-	});
-	if (!selectedElement) {
-		return createUnavailableState({
-			reason: "selected-element-missing",
-			message: "The selected keyframe could not be resolved.",
-		});
+interface GraphEditorPropertySelection {
+	propertyPath: SelectedKeyframeRef["propertyPath"];
+	keyframeId: string;
+	secondaryKeyframeId: string | null;
+	options: GraphEditorPropertyOption[];
+}
+
+function resolvePropertySelection({
+	element,
+	propertyKeyframes,
+}: {
+	element: TimelineElement;
+	propertyKeyframes: ReturnType<
+		typeof groupSelectedKeyframesByProperty
+	>[number];
+}):
+	| GraphEditorPropertySelection
+	| {
+			reason: GraphEditorUnavailableReason;
+			message: string;
+	  } {
+	if (propertyKeyframes.keyframes.length > 2) {
+		return {
+			reason: "multiple-keyframes-selected",
+			message: "Select at most two adjacent keyframes per property.",
+		};
 	}
 
-	if (!selectedElement.element.animations) {
-		return createUnavailableState({
+	if (!element.animations) {
+		return {
 			reason: "selected-element-has-no-animations",
 			message: "The selected keyframe has no editable graph.",
-		});
+		};
 	}
 
-	const scalarChannels = getEditableScalarChannels({
-		animations: selectedElement.element.animations,
-		propertyPath: primaryKeyframe.propertyPath,
+	const scalarResult = getEditableScalarChannels({
+		animations: element.animations,
+		propertyPath: propertyKeyframes.propertyPath,
 	});
-	if (scalarChannels.length === 0) {
-		return createUnavailableState({
+	if (!scalarResult || scalarResult.channels.length === 0) {
+		return {
 			reason: "selected-keyframe-has-no-scalar-channel",
 			message: "The selected keyframe has no editable graph channel.",
-		});
+		};
 	}
 
-	// When 2 keyframes are selected, resolve the earlier one as the outgoing-segment
-	// anchor so the graph editor edits the curve between the two selected keyframes.
+	const primaryKeyframe = propertyKeyframes.keyframes[0];
 	let resolvedKeyframeId = primaryKeyframe.keyframeId;
+	let secondaryKeyframeId =
+		propertyKeyframes.keyframes.length === 2
+			? propertyKeyframes.keyframes[1].keyframeId
+			: null;
+
 	if (secondaryKeyframeId !== null) {
 		const time1 = findKeyframeTime({
-			animations: selectedElement.element.animations,
-			propertyPath: primaryKeyframe.propertyPath,
+			animations: element.animations,
+			propertyPath: propertyKeyframes.propertyPath,
 			keyframeId: primaryKeyframe.keyframeId,
 		});
 		const time2 = findKeyframeTime({
-			animations: selectedElement.element.animations,
-			propertyPath: primaryKeyframe.propertyPath,
+			animations: element.animations,
+			propertyPath: propertyKeyframes.propertyPath,
 			keyframeId: secondaryKeyframeId,
 		});
 		if (time2 !== null && (time1 === null || time2 < time1)) {
 			resolvedKeyframeId = secondaryKeyframeId;
+			secondaryKeyframeId = primaryKeyframe.keyframeId;
 		}
 	}
 
+	const { binding: resolvedBinding, channels: scalarChannels } = scalarResult;
+	const easingMode = getEasingModeForKind(resolvedBinding.kind);
 	const contexts = scalarChannels.flatMap((channel) => {
 		const context = getScalarKeyframeContext({
-			animations: selectedElement.element.animations,
-			propertyPath: primaryKeyframe.propertyPath,
+			animations: element.animations,
+			propertyPath: propertyKeyframes.propertyPath,
 			componentKey: channel.componentKey,
 			keyframeId: resolvedKeyframeId,
 		});
@@ -287,85 +325,301 @@ export function resolveGraphEditorSelectionState({
 	});
 
 	if (contexts.length === 0) {
+		return {
+			reason: "selected-keyframe-missing-on-channel",
+			message: "The selected keyframe is not editable as a graph segment.",
+		};
+	}
+
+	// For shared-easing bindings (e.g. color), all components always use the same
+	// curve. Collapse them to a single "value" option so the key is compatible with
+	// single-component scalar bindings (e.g. opacity), enabling mixed selections.
+	const options =
+		easingMode === "shared"
+			? [
+					{
+						key: "value",
+						label: "Curve",
+						context: contexts[0].context,
+						allContexts: contexts.map(({ context }) => context),
+					},
+				]
+			: contexts.map(({ context, option }) => ({
+					key: option.key,
+					label: option.label,
+					context,
+					allContexts: [context],
+				}));
+
+	return {
+		propertyPath: propertyKeyframes.propertyPath,
+		keyframeId: resolvedKeyframeId,
+		secondaryKeyframeId,
+		options,
+	};
+}
+
+function isLinearCurve({
+	cubicBezier,
+}: {
+	cubicBezier: NormalizedCubicBezier;
+}): boolean {
+	return (
+		Math.abs(cubicBezier[0]) <= LINEAR_CURVE_EPSILON &&
+		Math.abs(cubicBezier[1]) <= LINEAR_CURVE_EPSILON &&
+		Math.abs(cubicBezier[2] - 1) <= LINEAR_CURVE_EPSILON &&
+		Math.abs(cubicBezier[3] - 1) <= LINEAR_CURVE_EPSILON
+	);
+}
+
+function resolveSegmentForOption({
+	propertySelection,
+	componentKey,
+}: {
+	propertySelection: GraphEditorPropertySelection;
+	componentKey: string;
+}):
+	| {
+			segment: GraphEditorResolvedSegment;
+	  }
+	| {
+			reason: GraphEditorUnavailableReason;
+			message: string;
+	  } {
+	const option = propertySelection.options.find(
+		(propertyOption) => propertyOption.key === componentKey,
+	);
+	if (!option) {
+		return {
+			reason: "selected-properties-have-no-shared-component",
+			message: "Selected properties do not share a graph-editable channel.",
+		};
+	}
+
+	if (!option.context.nextKey) {
+		return {
+			reason: "selected-keyframe-has-no-next-segment",
+			message: "Select a keyframe that has an outgoing segment.",
+		};
+	}
+
+	if (
+		propertySelection.secondaryKeyframeId !== null &&
+		option.context.nextKey.id !== propertySelection.secondaryKeyframeId
+	) {
+		return {
+			reason: "selected-keyframes-are-not-adjacent",
+			message: "Selected keyframes must be adjacent on each property.",
+		};
+	}
+
+	if (option.context.keyframe.segmentToNext === "step") {
+		return {
+			reason: "selected-segment-is-hold",
+			message: "Hold segments have a fixed value - easing has no effect here.",
+		};
+	}
+
+	const referenceSpanValue = getReferenceSpanValue({ context: option.context });
+	const cubicBezier =
+		option.context.keyframe.segmentToNext === "linear"
+			? GRAPH_LINEAR_CURVE
+			: getNormalizedCubicBezierForScalarSegment({
+					leftKey: option.context.keyframe,
+					rightKey: option.context.nextKey,
+					referenceSpanValue,
+				});
+	if (!cubicBezier) {
+		return {
+			reason: "selected-segment-is-flat",
+			message:
+				"Cannot edit a segment where both keyframes are at the same time.",
+		};
+	}
+
+	return {
+		segment: {
+			propertyPath: propertySelection.propertyPath,
+			keyframeId: propertySelection.keyframeId,
+			context: option.context,
+			allContexts: option.allContexts,
+			cubicBezier,
+			referenceSpanValue,
+		},
+	};
+}
+
+export function resolveGraphEditorSelectionState({
+	tracks,
+	selectedKeyframes,
+	preferredComponentKey,
+}: {
+	tracks: SceneTracks;
+	selectedKeyframes: SelectedKeyframeRef[];
+	preferredComponentKey?: string | null;
+}): GraphEditorSelectionState {
+	if (selectedKeyframes.length === 0) {
+		return createUnavailableState({
+			reason: "no-keyframe-selected",
+			message: "Select a keyframe to edit its curve.",
+		});
+	}
+
+	const propertyKeyframes = groupSelectedKeyframesByProperty({
+		selectedKeyframes,
+	});
+	const primaryKeyframe = propertyKeyframes[0]?.keyframes[0];
+	if (!primaryKeyframe) {
+		return createUnavailableState({
+			reason: "no-keyframe-selected",
+			message: "Select a keyframe to edit its curve.",
+		});
+	}
+
+	const selectedElement = findElementByKeyframe({
+		tracks,
+		keyframe: primaryKeyframe,
+	});
+	if (!selectedElement) {
+		return createUnavailableState({
+			reason: "selected-element-missing",
+			message: "The selected keyframe could not be resolved.",
+		});
+	}
+
+	const spansMultipleElements = propertyKeyframes.some(
+		(propertySelection) =>
+			propertySelection.trackId !== selectedElement.trackId ||
+			propertySelection.elementId !== selectedElement.elementId,
+	);
+	if (spansMultipleElements) {
+		return createUnavailableState({
+			reason: "selected-keyframes-span-multiple-elements",
+			message: "Selected keyframes must be on the same element.",
+		});
+	}
+
+	const propertySelections = propertyKeyframes.map((propertySelection) =>
+		resolvePropertySelection({
+			element: selectedElement.element,
+			propertyKeyframes: propertySelection,
+		}),
+	);
+	const unavailablePropertySelection = propertySelections.find(
+		(propertySelection) => "reason" in propertySelection,
+	);
+	if (
+		unavailablePropertySelection &&
+		"reason" in unavailablePropertySelection
+	) {
+		return createUnavailableState({
+			reason: unavailablePropertySelection.reason,
+			message: unavailablePropertySelection.message,
+		});
+	}
+
+	const resolvedPropertySelections = propertySelections.filter(
+		(propertySelection): propertySelection is GraphEditorPropertySelection =>
+			!("reason" in propertySelection),
+	);
+	const sharedComponentOptions =
+		resolvedPropertySelections[0]?.options.filter((componentOption) =>
+			resolvedPropertySelections.every((propertySelection) =>
+				propertySelection.options.some(
+					(option) => option.key === componentOption.key,
+				),
+			),
+		) ?? [];
+	const componentOptions = sharedComponentOptions.map(({ key, label }) => ({
+		key,
+		label,
+	}));
+	if (componentOptions.length === 0) {
+		return createUnavailableState({
+			reason: "selected-properties-have-no-shared-component",
+			message: "Selected properties do not share a graph-editable channel.",
+		});
+	}
+
+	// Try each component option in preference order (preferred first, then the rest)
+	// and stop at the first key where every property resolves to a valid segment.
+	// This single pass both selects the active key and produces the segment list.
+	const candidateKeys = [
+		...(preferredComponentKey &&
+		componentOptions.some((option) => option.key === preferredComponentKey)
+			? [preferredComponentKey]
+			: []),
+		...componentOptions
+			.filter((option) => option.key !== preferredComponentKey)
+			.map((option) => option.key),
+	];
+
+	let activeComponentKey = componentOptions[0].key;
+	let segmentResults: ReturnType<typeof resolveSegmentForOption>[] = [];
+
+	for (const candidateKey of candidateKeys) {
+		const results = resolvedPropertySelections.map((propertySelection) =>
+			resolveSegmentForOption({
+				propertySelection,
+				componentKey: candidateKey,
+			}),
+		);
+		activeComponentKey = candidateKey;
+		segmentResults = results;
+		if (results.every((result) => "segment" in result)) {
+			break;
+		}
+	}
+
+	const unavailableSegment = segmentResults.find(
+		(result) => !("segment" in result),
+	);
+	if (unavailableSegment && !("segment" in unavailableSegment)) {
+		return createUnavailableState({
+			reason: unavailableSegment.reason,
+			message: unavailableSegment.message,
+			componentOptions,
+			activeComponentKey,
+		});
+	}
+
+	const segments = segmentResults.flatMap((result) =>
+		"segment" in result ? [result.segment] : [],
+	);
+	const primarySegment = segments[0];
+	if (!primarySegment) {
 		return createUnavailableState({
 			reason: "selected-keyframe-missing-on-channel",
 			message: "The selected keyframe is not editable as a graph segment.",
-		});
-	}
-
-	const nextSegmentContexts = contexts.filter(
-		({ context }) => context.nextKey !== null,
-	);
-	const preferredContext =
-		contexts.find(({ option }) => option.key === preferredComponentKey) ?? null;
-	const activeContext =
-		preferredContext ?? nextSegmentContexts[0] ?? contexts[0];
-	const componentOptions = contexts.map(({ option }) => option);
-
-	if (!activeContext.context.nextKey) {
-		return createUnavailableState({
-			reason: "selected-keyframe-has-no-next-segment",
-			message: "Select a keyframe that has an outgoing segment.",
 			componentOptions,
-			activeComponentKey: activeContext.option.key,
-		});
-	}
-
-	if (isFlatSegment({ context: activeContext.context })) {
-		return createUnavailableState({
-			reason: "selected-segment-is-flat",
-			message: "Flat segments are not graph-editable in this popover yet.",
-			componentOptions,
-			activeComponentKey: activeContext.option.key,
-		});
-	}
-
-	if (activeContext.context.keyframe.segmentToNext === "step") {
-		return createUnavailableState({
-			reason: "selected-segment-is-hold",
-			message: "Hold segments are not graph-editable in this popover yet.",
-			componentOptions,
-			activeComponentKey: activeContext.option.key,
-		});
-	}
-
-	const cubicBezier =
-		activeContext.context.keyframe.segmentToNext === "linear"
-			? GRAPH_LINEAR_CURVE
-			: getNormalizedCubicBezierForScalarSegment({
-					leftKey: activeContext.context.keyframe,
-					rightKey: activeContext.context.nextKey,
-				});
-	if (!cubicBezier) {
-		return createUnavailableState({
-			reason: "selected-segment-is-flat",
-			message: "The selected segment cannot be represented in this graph view.",
-			componentOptions,
-			activeComponentKey: activeContext.option.key,
+			activeComponentKey,
 		});
 	}
 
 	return {
 		status: "ready",
-		message: "Edit graph",
+		message:
+			segments.length === 1
+				? "Edit graph"
+				: `Edit graph for ${segments.length} properties`,
 		componentOptions,
-		activeComponentKey: activeContext.option.key,
+		activeComponentKey,
 		trackId: selectedElement.trackId,
 		elementId: selectedElement.elementId,
-		propertyPath: primaryKeyframe.propertyPath,
-		keyframeId: resolvedKeyframeId,
 		element: selectedElement.element,
-		context: activeContext.context,
-		cubicBezier,
+		segments,
+		cubicBezier: primarySegment.cubicBezier,
 	};
 }
 
 export function buildGraphEditorCurvePatches({
 	context,
 	cubicBezier,
+	referenceSpanValue,
 }: {
 	context: ScalarGraphKeyframeContext;
 	cubicBezier: NormalizedCubicBezier;
+	referenceSpanValue: number;
 }): GraphEditorCurvePatch[] | null {
 	if (!context.nextKey) {
 		return null;
@@ -393,6 +647,7 @@ export function buildGraphEditorCurvePatches({
 		leftKey: context.keyframe,
 		rightKey: context.nextKey,
 		cubicBezier,
+		referenceSpanValue,
 	});
 	if (!handles) {
 		return null;
@@ -419,14 +674,17 @@ export function applyGraphEditorCurvePreview({
 	animations,
 	context,
 	cubicBezier,
+	referenceSpanValue,
 }: {
 	animations: ElementAnimations | undefined;
 	context: ScalarGraphKeyframeContext;
 	cubicBezier: NormalizedCubicBezier;
+	referenceSpanValue: number;
 }): ElementAnimations | undefined {
 	const patches = buildGraphEditorCurvePatches({
 		context,
 		cubicBezier,
+		referenceSpanValue,
 	});
 	if (!patches) {
 		return animations;

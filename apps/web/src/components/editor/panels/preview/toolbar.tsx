@@ -22,7 +22,7 @@ import {
 	SelectItem,
 	SelectSeparator,
 } from "@/components/ui/select";
-import { PREVIEW_ZOOM_PRESETS } from "@/lib/preview/constants";
+import { PREVIEW_ZOOM_PRESETS } from "@/lib/preview/zoom";
 import { usePreviewViewport } from "./preview-viewport";
 import { GridPopover } from "./guide-popover";
 import { usePreviewStore } from "@/stores/preview-store";
@@ -42,7 +42,8 @@ export function PreviewToolbar({
 			<div className="justify-self-end flex items-center gap-2.5">
 				<ZoomSelect />
 				<Separator orientation="vertical" className="h-4" />
-				<GridPopover>
+				{/* v0.4.0 */}
+				{/* <GridPopover>
 					<Button
 						variant={activeGuideDefinition ? "secondary" : "text"}
 						size="icon"
@@ -53,7 +54,7 @@ export function PreviewToolbar({
 							<HugeiconsIcon icon={GridTableIcon} />
 						)}
 					</Button>
-				</GridPopover>
+				</GridPopover> */}
 				<Button variant="text" onClick={onToggleFullscreen}>
 					<HugeiconsIcon icon={FullScreenIcon} />
 				</Button>
