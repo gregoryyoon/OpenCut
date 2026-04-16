@@ -15,7 +15,10 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push:local": "cross-env NODE_ENV=development drizzle-kit push",
-    "db:push:prod": "cross-env NODE_ENV=production drizzle-kit push"
+    "db:push:prod": "cross-env NODE_ENV=production drizzle-kit push",
+    "dev:tauri": "cd ../tauri && bunx tauri dev",
+    "build:tauri": "cross-env TAURI_BUILD=true next build",
+    "build:tauri-app": "cd ../tauri && bunx tauri build"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",
@@ -97,6 +100,8 @@
     "sharp": "^0.34.5",
     "tailwindcss": "^4.2.1",
     "typescript": "^5.8.3",
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/cli": "^2.1.0",
     "wrangler": "^4.77.0"
   }
 }
