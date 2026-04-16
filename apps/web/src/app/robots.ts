@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { SITE_URL } from "@/constants/site-constants";
+import { SITE_URL } from "@/lib/site/brand";
 
 export const dynamic = "force-static";
 

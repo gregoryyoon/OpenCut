@@ -9,6 +9,13 @@ import {
 import { useEditor } from "@/hooks/use-editor";
 import { useShiftKey } from "@/hooks/use-shift-key";
 import { useElementSelection } from "@/hooks/timeline/element/use-element-selection";
+import {
+	buildMoveGroup,
+	resolveGroupMove,
+	snapGroupEdges,
+	type GroupMoveResult,
+	type MoveGroup,
+} from "@/lib/timeline/group-move";
 import { BASE_TIMELINE_PIXELS_PER_SECOND } from "@/lib/timeline/scale";
 import { TICKS_PER_SECOND } from "@/lib/wasm";
 import { TIMELINE_DRAG_THRESHOLD_PX } from "@/components/editor/panels/timeline/interaction";
@@ -16,10 +23,11 @@ import { roundToFrame } from "opencut-wasm";
 import { computeDropTarget } from "@/components/editor/panels/timeline/drop-target";
 import { getMouseTimeFromClientX } from "@/lib/timeline/drag-utils";
 import { generateUUID } from "@/utils/id";
-import { snapElementEdge, type SnapPoint } from "@/lib/timeline/snap-utils";
+import type { SnapPoint } from "@/lib/timeline/snap-utils";
 import { registerCanceller } from "@/lib/cancel-interaction";
 import type {
 	DropTarget,
+	ElementRef,
 	ElementDragState,
 	SceneTracks,
 	TimelineElement,
@@ -41,6 +49,8 @@ const MOUSE_BUTTON_RIGHT = 2;
 const initialDragState: ElementDragState = {
 	isDragging: false,
 	elementId: null,
+	dragElementIds: [],
+	dragTimeOffsets: {},
 	trackId: null,
 	startMouseX: 0,
 	startMouseY: 0,
@@ -53,6 +63,7 @@ const initialDragState: ElementDragState = {
 interface PendingDragState {
 	elementId: string;
 	trackId: string;
+	selectedElements: ElementRef[];
 	startMouseX: number;
 	startMouseY: number;
 	startElementTime: number;
@@ -114,11 +125,9 @@ function getDragDropTarget({
 	const scrollContainer = tracksScrollRef.current;
 	if (!containerRect || !scrollContainer) return null;
 
-	const sourceTrack = [
-		...tracks.overlay,
-		tracks.main,
-		...tracks.audio,
-	].find(({ id }) => id === trackId);
+	const sourceTrack = [...tracks.overlay, tracks.main, ...tracks.audio].find(
+		({ id }) => id === trackId,
+	);
 	const movingElement = sourceTrack?.elements.find(
 		({ id }) => id === elementId,
 	);
@@ -169,12 +178,8 @@ export function useElementInteraction({
 	const editor = useEditor();
 	const isShiftHeldRef = useShiftKey();
 	const sceneTracks = editor.scenes.getActiveScene().tracks;
-	const tracks = [
-		...sceneTracks.overlay,
-		sceneTracks.main,
-		...sceneTracks.audio,
-	];
 	const {
+		selectedElements,
 		isElementSelected,
 		selectElement,
 		handleElementClick: handleSelectionClick,
@@ -185,12 +190,17 @@ export function useElementInteraction({
 	const [dragDropTarget, setDragDropTarget] = useState<DropTarget | null>(null);
 	const [isPendingDrag, setIsPendingDrag] = useState(false);
 	const pendingDragRef = useRef<PendingDragState | null>(null);
+	const moveGroupRef = useRef<MoveGroup | null>(null);
+	const newTrackIdsRef = useRef<string[]>([]);
+	const groupMoveResultRef = useRef<GroupMoveResult | null>(null);
 	const lastMouseXRef = useRef(0);
 	const mouseDownLocationRef = useRef<{ x: number; y: number } | null>(null);
 
 	const startDrag = useCallback(
 		({
 			elementId,
+			dragElementIds,
+			dragTimeOffsets,
 			trackId,
 			startMouseX,
 			startMouseY,
@@ -202,6 +212,8 @@ export function useElementInteraction({
 			setDragState({
 				isDragging: true,
 				elementId,
+				dragElementIds,
+				dragTimeOffsets,
 				trackId,
 				startMouseX,
 				startMouseY,
@@ -215,6 +227,9 @@ export function useElementInteraction({
 	);
 
 	const endDrag = useCallback(() => {
+		moveGroupRef.current = null;
+		newTrackIdsRef.current = [];
+		groupMoveResultRef.current = null;
 		setDragState(initialDragState);
 		setDragDropTarget(null);
 	}, []);
@@ -227,6 +242,70 @@ export function useElementInteraction({
 		onSnapPointChange?.(null);
 	}, [endDrag, onSnapPointChange]);
 
+	const resolveGroupDragMove = useCallback(
+		({
+			group,
+			snappedTime,
+			dropTarget,
+		}: {
+			group: MoveGroup;
+			snappedTime: number;
+			dropTarget: DropTarget | null;
+		}): GroupMoveResult | null => {
+			if (!dropTarget) {
+				return null;
+			}
+
+			if (dropTarget.isNewTrack) {
+				return resolveGroupMove({
+					group,
+					tracks: sceneTracks,
+					anchorStartTime: snappedTime,
+					target: {
+						kind: "newTracks",
+						anchorInsertIndex: dropTarget.trackIndex,
+						newTrackIds: newTrackIdsRef.current,
+					},
+				});
+			}
+
+			const orderedTracks = [
+				...sceneTracks.overlay,
+				sceneTracks.main,
+				...sceneTracks.audio,
+			];
+			const targetTrack = orderedTracks[dropTarget.trackIndex];
+			if (!targetTrack) {
+				return null;
+			}
+
+			const existingTrackResult = resolveGroupMove({
+				group,
+				tracks: sceneTracks,
+				anchorStartTime: snappedTime,
+				target: {
+					kind: "existingTrack",
+					anchorTargetTrackId: targetTrack.id,
+				},
+			});
+			if (existingTrackResult) {
+				return existingTrackResult;
+			}
+
+			return resolveGroupMove({
+				group,
+				tracks: sceneTracks,
+				anchorStartTime: snappedTime,
+				target: {
+					kind: "newTracks",
+					anchorInsertIndex: dropTarget.trackIndex,
+					newTrackIds: newTrackIdsRef.current,
+				},
+			});
+		},
+		[sceneTracks],
+	);
+
 	useEffect(() => {
 		if (!dragState.isDragging && !isPendingDrag) return;
 
@@ -236,51 +315,29 @@ export function useElementInteraction({
 	const getDragSnapResult = useCallback(
 		({
 			frameSnappedTime,
-			movingElement,
+			group,
 		}: {
 			frameSnappedTime: number;
-			movingElement: TimelineElement | null | undefined;
+			group: MoveGroup | null;
 		}) => {
-			const shouldSnap = snappingEnabled && !isShiftHeldRef.current;
-			if (!shouldSnap || !movingElement) {
+			if (!group || !snappingEnabled || isShiftHeldRef.current) {
 				return { snappedTime: frameSnappedTime, snapPoint: null };
 			}
 
-			const elementDuration = movingElement.duration;
-			const playheadTime = editor.playback.getCurrentTime();
-
-			const startSnap = snapElementEdge({
-				targetTime: frameSnappedTime,
-				elementDuration,
+			const groupSnap = snapGroupEdges({
+				group,
+				anchorStartTime: frameSnappedTime,
 				tracks: sceneTracks,
-				playheadTime,
+				playheadTime: editor.playback.getCurrentTime(),
 				zoomLevel,
-				excludeElementId: movingElement.id,
-				snapToStart: true,
 			});
-
-			const endSnap = snapElementEdge({
-				targetTime: frameSnappedTime,
-				elementDuration,
-				tracks: sceneTracks,
-				playheadTime,
-				zoomLevel,
-				excludeElementId: movingElement.id,
-				snapToStart: false,
-			});
-
-			const snapResult =
-				startSnap.snapDistance <= endSnap.snapDistance ? startSnap : endSnap;
-			if (!snapResult.snapPoint) {
-				return { snappedTime: frameSnappedTime, snapPoint: null };
-			}
 
 			return {
-				snappedTime: snapResult.snappedTime,
-				snapPoint: snapResult.snapPoint,
+				snappedTime: groupSnap.snappedAnchorStartTime,
+				snapPoint: groupSnap.snapPoint,
 			};
 		},
-		[snappingEnabled, editor.playback, tracks, zoomLevel, isShiftHeldRef],
+		[snappingEnabled, editor.playback, sceneTracks, zoomLevel, isShiftHeldRef],
 	);
 
 	useEffect(() => {
@@ -309,19 +366,83 @@ export function useElementInteraction({
 						zoomLevel,
 						scrollLeft,
 					});
-				const adjustedTime = Math.max(
-					0,
-					mouseTime - pendingDragRef.current.clickOffsetTime,
-				);
-				const snappedTime = roundToFrame({
-					time: adjustedTime,
-					rate: activeProject.settings.fps,
-				}) ?? adjustedTime;
-				startDrag({
-					...pendingDragRef.current,
-					initialCurrentTime: snappedTime,
+					const adjustedTime = Math.max(
+						0,
+						mouseTime - pendingDragRef.current.clickOffsetTime,
+					);
+					const snappedTime =
+						roundToFrame({
+							time: adjustedTime,
+							rate: activeProject.settings.fps,
+						}) ?? adjustedTime;
+					const moveGroup = buildMoveGroup({
+						anchorRef: {
+							trackId: pendingDragRef.current.trackId,
+							elementId: pendingDragRef.current.elementId,
+						},
+						selectedElements: pendingDragRef.current.selectedElements,
+						tracks: sceneTracks,
+					});
+					if (!moveGroup) {
+						return;
+					}
+
+					moveGroupRef.current = moveGroup;
+					newTrackIdsRef.current = moveGroup.members.map(() => generateUUID());
+					const dragTimeOffsets: Record<string, number> = {};
+					for (const member of moveGroup.members) {
+						dragTimeOffsets[member.elementId] = member.timeOffset;
+					}
+					const {
+						snappedTime: initialSnappedTime,
+						snapPoint: initialSnapPoint,
+					} = getDragSnapResult({
+						frameSnappedTime: snappedTime,
+						group: moveGroup,
+					});
+					const verticalDragDirection = getVerticalDragDirection({
+						startMouseY: pendingDragRef.current.startMouseY,
+						currentMouseY: clientY,
+					});
+					const anchorDropTarget = getDragDropTarget({
+						clientX,
+						clientY,
+						elementId: pendingDragRef.current.elementId,
+						trackId: pendingDragRef.current.trackId,
+						tracks: sceneTracks,
+						tracksContainerRef,
+						tracksScrollRef,
+						headerRef,
+						zoomLevel,
+						snappedTime: initialSnappedTime,
+						verticalDragDirection,
+					});
+					const nextGroupMoveResult =
+						anchorDropTarget != null
+							? resolveGroupDragMove({
+									group: moveGroup,
+									snappedTime: initialSnappedTime,
+									dropTarget: anchorDropTarget,
+								})
+							: null;
+					groupMoveResultRef.current = nextGroupMoveResult;
+					setDragDropTarget(
+						anchorDropTarget &&
+							(anchorDropTarget.isNewTrack || !nextGroupMoveResult)
+							? {
+									...anchorDropTarget,
+									isNewTrack: true,
+								}
+							: null,
+					);
+					startDrag({
+						...pendingDragRef.current,
+						dragElementIds: moveGroup.members.map((member) => member.elementId),
+						dragTimeOffsets,
+						initialCurrentTime: initialSnappedTime,
 						initialCurrentMouseY: clientY,
 					});
+					onSnapPointChange?.(initialSnapPoint);
 					startedDragThisEvent = true;
 					pendingDragRef.current = null;
 					setIsPendingDrag(false);
@@ -359,15 +480,13 @@ export function useElementInteraction({
 			});
 			const adjustedTime = Math.max(0, mouseTime - dragState.clickOffsetTime);
 			const fps = activeProject.settings.fps;
-			const frameSnappedTime = roundToFrame({ time: adjustedTime, rate: fps }) ?? adjustedTime;
+			const frameSnappedTime =
+				roundToFrame({ time: adjustedTime, rate: fps }) ?? adjustedTime;
 
-			const sourceTrack = tracks.find(({ id }) => id === dragState.trackId);
-			const movingElement = sourceTrack?.elements.find(
-				({ id }) => id === dragState.elementId,
-			);
+			const moveGroup = moveGroupRef.current;
 			const { snappedTime, snapPoint } = getDragSnapResult({
 				frameSnappedTime,
-				movingElement,
+				group: moveGroup,
 			});
 			setDragState((previousDragState) => ({
 				...previousDragState,
@@ -381,7 +500,7 @@ export function useElementInteraction({
 					startMouseY: dragState.startMouseY,
 					currentMouseY: clientY,
 				});
-				const dropTarget = getDragDropTarget({
+				const anchorDropTarget = getDragDropTarget({
 					clientX,
 					clientY,
 					elementId: dragState.elementId,
@@ -394,7 +513,24 @@ export function useElementInteraction({
 					snappedTime,
 					verticalDragDirection,
 				});
-				setDragDropTarget(dropTarget?.isNewTrack ? dropTarget : null);
+				const nextGroupMoveResult =
+					moveGroup && anchorDropTarget
+						? resolveGroupDragMove({
+								group: moveGroup,
+								snappedTime,
+								dropTarget: anchorDropTarget,
+							})
+						: null;
+				groupMoveResultRef.current = nextGroupMoveResult;
+				setDragDropTarget(
+					anchorDropTarget &&
+						(anchorDropTarget.isNewTrack || !nextGroupMoveResult)
+						? {
+								...anchorDropTarget,
+								isNewTrack: true,
+							}
+						: null,
+				);
 			}
 		};
 
@@ -414,10 +550,11 @@ export function useElementInteraction({
 		tracksScrollRef,
 		tracksContainerRef,
 		headerRef,
-		tracks,
 		isPendingDrag,
 		startDrag,
 		getDragSnapResult,
+		resolveGroupDragMove,
+		sceneTracks,
 		onSnapPointChange,
 	]);
 
@@ -441,77 +578,41 @@ export function useElementInteraction({
 				}
 			}
 
-			const dropTarget = getDragDropTarget({
-				clientX,
-				clientY,
-				elementId: dragState.elementId,
-				trackId: dragState.trackId,
-				tracks: sceneTracks,
-				tracksContainerRef,
-				tracksScrollRef,
-				headerRef,
-				zoomLevel,
-				snappedTime: dragState.currentTime,
-				verticalDragDirection: getVerticalDragDirection({
-					startMouseY: dragState.startMouseY,
-					currentMouseY: clientY,
-				}),
+			const moveGroup = moveGroupRef.current;
+			if (!moveGroup) {
+				endDrag();
+				onSnapPointChange?.(null);
+				return;
+			}
+
+			const groupMoveResult = groupMoveResultRef.current;
+			if (!groupMoveResult) {
+				endDrag();
+				onSnapPointChange?.(null);
+				return;
+			}
+
+			const didMove = groupMoveResult.moves.some((move) => {
+				const currentMember = moveGroup.members.find(
+					(member) => member.elementId === move.elementId,
+				);
+				const originalStartTime =
+					dragState.startElementTime + (currentMember?.timeOffset ?? 0);
+				return (
+					currentMember?.trackId !== move.targetTrackId ||
+					originalStartTime !== move.newStartTime
+				);
 			});
-			if (!dropTarget) {
-				endDrag();
-				onSnapPointChange?.(null);
-				return;
-			}
-			const snappedTime = dragState.currentTime;
-
-			const sourceTrack = tracks.find(({ id }) => id === dragState.trackId);
-			if (!sourceTrack) {
-				endDrag();
-				onSnapPointChange?.(null);
-				return;
-			}
-			const movingElement =
-				sourceTrack.elements.find(({ id }) => id === dragState.elementId) ?? null;
-			if (
-				movingElement &&
-				!dropTarget.isNewTrack &&
-				tracks[dropTarget.trackIndex]?.id === dragState.trackId &&
-				snappedTime === movingElement.startTime
-			) {
+			if (!didMove && groupMoveResult.createTracks.length === 0) {
 				endDrag();
 				onSnapPointChange?.(null);
 				return;
 			}
 
-			if (dropTarget.isNewTrack) {
-				const newTrackId = generateUUID();
-
-				editor.timeline.moveElement({
-					sourceTrackId: dragState.trackId,
-					targetTrackId: newTrackId,
-					elementId: dragState.elementId,
-					newStartTime: snappedTime,
-					createTrack: { type: sourceTrack.type, index: dropTarget.trackIndex },
-				});
-				selectElement({ trackId: newTrackId, elementId: dragState.elementId });
-			} else {
-				const targetTrack = tracks[dropTarget.trackIndex];
-				if (targetTrack) {
-					editor.timeline.moveElement({
-						sourceTrackId: dragState.trackId,
-						targetTrackId: targetTrack.id,
-						elementId: dragState.elementId,
-						newStartTime: snappedTime,
-					});
-					if (targetTrack.id !== dragState.trackId) {
-						selectElement({
-							trackId: targetTrack.id,
-							elementId: dragState.elementId,
-						});
-					}
-				}
-			}
-
+			editor.timeline.moveElements({
+				moves: groupMoveResult.moves,
+				createTracks: groupMoveResult.createTracks,
+			});
 			endDrag();
 			onSnapPointChange?.(null);
 		};
@@ -521,18 +622,11 @@ export function useElementInteraction({
 	}, [
 		dragState.isDragging,
 		dragState.elementId,
-		dragState.startMouseY,
+		dragState.startElementTime,
 		dragState.trackId,
-		dragState.currentTime,
-		zoomLevel,
-		tracks,
 		endDrag,
 		onSnapPointChange,
 		editor.timeline,
-		tracksContainerRef,
-		tracksScrollRef,
-		headerRef,
-		selectElement,
 	]);
 
 	useEffect(() => {
@@ -594,9 +688,17 @@ export function useElementInteraction({
 				elementRect: event.currentTarget.getBoundingClientRect(),
 				zoomLevel,
 			});
+			const elementRef = {
+				trackId: track.id,
+				elementId: element.id,
+			};
+			const pendingSelectedElements = isElementSelected(elementRef)
+				? selectedElements
+				: [elementRef];
 			pendingDragRef.current = {
 				elementId: element.id,
 				trackId: track.id,
+				selectedElements: pendingSelectedElements,
 				startMouseX: event.clientX,
 				startMouseY: event.clientY,
 				startElementTime: element.startTime,
@@ -604,7 +706,7 @@ export function useElementInteraction({
 			};
 			setIsPendingDrag(true);
 		},
-		[zoomLevel, isElementSelected, handleSelectionClick],
+		[zoomLevel, isElementSelected, handleSelectionClick, selectedElements],
 	);
 
 	const handleElementClick = useCallback(
@@ -638,14 +740,14 @@ export function useElementInteraction({
 				trackId: track.id,
 				elementId: element.id,
 			});
-			if (!alreadySelected) {
+			if (!alreadySelected || selectedElements.length > 1) {
 				selectElement({ trackId: track.id, elementId: element.id });
 				return;
 			}
 
 			editor.selection.clearKeyframeSelection();
 		},
-		[editor.selection, isElementSelected, selectElement],
+		[editor.selection, isElementSelected, selectElement, selectedElements],
 	);
 
 	return {

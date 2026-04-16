@@ -12,9 +12,9 @@ import { storageService } from "@/services/storage/service";
 import { toast } from "sonner";
 import { generateUUID } from "@/utils/id";
 import { UpdateProjectSettingsCommand } from "@/lib/commands/project";
-import { DEFAULT_BACKGROUND_COLOR } from "@/lib/background/constants";
-import { DEFAULT_CANVAS_SIZE } from "@/lib/canvas/constants";
-import { DEFAULT_FPS } from "@/lib/fps/constants";
+import { DEFAULT_BACKGROUND_COLOR } from "@/lib/background/color";
+import { DEFAULT_CANVAS_SIZE } from "@/lib/canvas/sizes";
+import { DEFAULT_FPS } from "@/lib/fps/defaults";
 import { buildDefaultScene, getProjectDurationFromScenes } from "@/lib/scenes";
 import { buildScene } from "@/services/renderer/scene-builder";
 import { CanvasRenderer } from "@/services/renderer/canvas-renderer";
@@ -528,12 +528,10 @@ export class ProjectManager {
 	}
 
 	async prepareExit(): Promise<void> {
-		console.log("prepareExit", this.active);
 		if (!this.active) return;
 
 		try {
 			const didUpdateThumbnail = await this.updateThumbnailFromTimeline();
-			console.log("didUpdateThumbnail", didUpdateThumbnail);
 			if (didUpdateThumbnail) {
 				await this.editor.save.flush();
 			}

@@ -10,30 +10,31 @@ import {
 import {
 	BACKGROUND_BLUR_INTENSITY_PRESETS,
 	DEFAULT_BACKGROUND_BLUR_INTENSITY,
-	DEFAULT_BACKGROUND_COLOR,
-} from "@/lib/background/constants";
+} from "@/lib/background/blur";
+import { DEFAULT_BACKGROUND_COLOR } from "@/lib/background/color";
 import { patternCraftGradients } from "@/data/colors/pattern-craft";
 import { colors } from "@/data/colors/solid";
 import { syntaxUIGradients } from "@/data/colors/syntax-ui";
 import { useEditor } from "@/hooks/use-editor";
 import { effectPreviewService } from "@/services/renderer/effect-preview";
-import type { TCanvasSize } from "@/lib/project/types";
 import { cn } from "@/utils/ui";
+
+const BLUR_PREVIEW_UNIFORM_DIMENSIONS = {
+	width: 1920,
+	height: 1080,
+} as const;
 
 const BlurPreview = memo(
 	({
 		blur,
-		canvasSize,
 		isSelected,
 		onSelect,
 	}: {
 		blur: { label: string; value: number };
-		canvasSize: TCanvasSize;
 		isSelected: boolean;
 		onSelect: () => void;
 	}) => {
 		const canvasRef = useRef<HTMLCanvasElement>(null);
-		const { width, height } = canvasSize;
 
 		useEffect(() => {
 			const renderPreview = () => {
@@ -43,13 +44,15 @@ const BlurPreview = memo(
 					effectType: "blur",
 					params: { intensity: blur.value },
 					targetCanvas: canvasRef.current,
-					uniformDimensions: { width, height },
+					uniformDimensions: BLUR_PREVIEW_UNIFORM_DIMENSIONS,
 				});
 			};
 
 			renderPreview();
-			return effectPreviewService.onPreviewImageReady({ callback: renderPreview });
-		}, [blur.value, width, height]);
+			return effectPreviewService.onPreviewImageReady({
+				callback: renderPreview,
+			});
+		}, [blur.value]);
 
 		return (
 			<button
@@ -169,7 +172,6 @@ export function BackgroundContent() {
 	const currentBackgroundColor = isColorBackground
 		? (activeProject.settings.background as { color: string }).color
 		: DEFAULT_BACKGROUND_COLOR;
-	const canvasSize = activeProject.settings.canvasSize;
 
 	const blurPreviews = useMemo(
 		() =>
@@ -177,17 +179,21 @@ export function BackgroundContent() {
 				<BlurPreview
 					key={blur.value}
 					blur={blur}
-					canvasSize={canvasSize}
 					isSelected={isBlurBackground && currentBlurIntensity === blur.value}
 					onSelect={() => handleBlurSelect(blur.value)}
 				/>
 			)),
-		[canvasSize, isBlurBackground, currentBlurIntensity, handleBlurSelect],
+		[isBlurBackground, currentBlurIntensity, handleBlurSelect],
 	);
 
 	return (
 		<div className="flex flex-col">
-			<Section collapsible defaultOpen={true} sectionKey="background-blur" showTopBorder={false}>
+			<Section
+				collapsible
+				defaultOpen={true}
+				sectionKey="background-blur"
+				showTopBorder={false}
+			>
 				<SectionHeader>
 					<SectionTitle>Blur</SectionTitle>
 				</SectionHeader>

@@ -2,6 +2,7 @@ import { ThemeProvider } from "next-themes";
 import Script from "next/script";
 import "./globals.css";
 import { Toaster } from "../components/ui/sonner";
+import { ChangelogNotification } from "@/lib/changelog/components/changelog-notification";
 import { TooltipProvider } from "../components/ui/tooltip";
 import { baseMetaData } from "./metadata";
 import { BotIdClient } from "botid/client";
@@ -35,13 +36,6 @@ export default function RootLayout({
 							crossOrigin="anonymous"
 							strategy="beforeInteractive"
 						/>
-
-						{/* code to figma */}
-						{/* <script
-							dangerouslySetInnerHTML={{
-								__html: `(function(){var s=document.createElement('script');s.src='https://mcp.figma.com/mcp/html-to-design/capture.js';document.head.appendChild(s);})();`,
-							}}
-						/> */}
 					</>
 				)}
 			</head>

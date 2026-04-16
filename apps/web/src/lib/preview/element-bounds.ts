@@ -1,6 +1,6 @@
 import type { SceneTracks, TimelineElement } from "@/lib/timeline";
 import type { MediaAsset } from "@/lib/media/types";
-import { STICKER_INTRINSIC_SIZE_FALLBACK } from "@/constants/sticker-constants";
+import { STICKER_INTRINSIC_SIZE_FALLBACK } from "@/lib/stickers/intrinsic-size";
 import { DEFAULT_GRAPHIC_SOURCE_SIZE } from "@/lib/graphics";
 import { measureTextElement } from "@/lib/text/measure-element";
 import {
@@ -241,21 +241,6 @@ export function getEdgeHandlePosition({
 	return {
 		x: bounds.cx + (localX * cos - localY * sin),
 		y: bounds.cy + (localX * sin + localY * cos),
-	};
-}
-
-export function getRotationHandlePosition({
-	bounds,
-}: {
-	bounds: ElementBounds;
-}): { x: number; y: number } {
-	const angleRad = (bounds.rotation * Math.PI) / 180;
-	const cos = Math.cos(angleRad);
-	const sin = Math.sin(angleRad);
-	const localY = -bounds.height / 2 - ROTATION_HANDLE_OFFSET;
-	return {
-		x: bounds.cx - localY * sin,
-		y: bounds.cy + localY * cos,
 	};
 }
 
